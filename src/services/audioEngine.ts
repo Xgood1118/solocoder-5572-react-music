@@ -4,45 +4,78 @@ import { clamp, lerp } from '../utils'
 
 export class AudioEngine {
   private audioContext: AudioContext | null = null
-  private sourceNode: AudioBufferSourceNode | null = null
+  private audioElement: HTMLAudioElement | null = null
+  private sourceNode: MediaElementAudioSourceNode | null = null
   private gainNode: GainNode | null = null
   private analyserNode: AnalyserNode | null = null
   private eqFilters: BiquadFilterNode[] = []
-  private effectNodes: Map<string, AudioNode> = new Map()
   private convolverNode: ConvolverNode | null = null
   private compressorNode: DynamicsCompressorNode | null = null
   private stereoPannerNode: StereoPannerNode | null = null
   private currentSong: Song | null = null
-  private audioBuffer: AudioBuffer | null = null
   private isPlaying = false
-  private startTime = 0
-  private pauseTime = 0
   private volume = 0.7
   private muted = false
   private onTimeUpdate?: (time: number) => void
   private onEnded?: () => void
+  private onLoadedMetadata?: (duration: number) => void
   private animationFrameId: number | null = null
   private targetEqBands: number[] = new Array(10).fill(0)
   private currentEqBands: number[] = new Array(10).fill(0)
-  private eqSmoothing = 0.1
-  private fileUrl: string | null = null
+  private eqSmoothing = 0.08
+  private isInitialized = false
+  private effectsEnabled: Set<string> = new Set()
 
   constructor() {
-    this.initAudioContext()
+    this.audioElement = new Audio()
+    this.audioElement.crossOrigin = 'anonymous'
+    this.audioElement.preload = 'auto'
+
+    this.audioElement.addEventListener('timeupdate', () => {
+      if (this.audioElement) {
+        this.onTimeUpdate?.(this.audioElement.currentTime)
+      }
+    })
+
+    this.audioElement.addEventListener('ended', () => {
+      this.isPlaying = false
+      this.onEnded?.()
+    })
+
+    this.audioElement.addEventListener('loadedmetadata', () => {
+      if (this.audioElement) {
+        this.onLoadedMetadata?.(this.audioElement.duration)
+      }
+    })
+
+    this.audioElement.addEventListener('play', () => {
+      this.isPlaying = true
+      this.startSmoothEq()
+    })
+
+    this.audioElement.addEventListener('pause', () => {
+      this.isPlaying = false
+    })
   }
 
-  private initAudioContext() {
+  private async ensureAudioContext(): Promise<void> {
+    if (this.isInitialized && this.audioContext) return
+
     try {
       this.audioContext = new (window.AudioContext || (window as any).webkitAudioContext)()
+
+      this.sourceNode = this.audioContext.createMediaElementSource(this.audioElement!)
       this.gainNode = this.audioContext.createGain()
       this.analyserNode = this.audioContext.createAnalyser()
       this.analyserNode.fftSize = 2048
+      this.analyserNode.smoothingTimeConstant = 0.8
 
       this.createEQFilters()
       this.createEffectNodes()
       this.connectGraph()
 
       this.gainNode.gain.value = this.muted ? 0 : this.volume
+      this.isInitialized = true
     } catch (err) {
       console.error('Failed to initialize AudioContext:', err)
     }
@@ -56,7 +89,7 @@ export class AudioEngine {
       filter.type = index === 0 ? 'lowshelf' :
                     index === EQ_FREQUENCIES.length - 1 ? 'highshelf' : 'peaking'
       filter.frequency.value = freq
-      filter.Q.value = 1
+      filter.Q.value = 1.4
       filter.gain.value = 0
       return filter
     })
@@ -66,7 +99,7 @@ export class AudioEngine {
     if (!this.audioContext) return
 
     this.convolverNode = this.audioContext.createConvolver()
-    this.createReverbImpulse(2, 2)
+    this.createReverbImpulse(2, 0.3)
 
     this.compressorNode = this.audioContext.createDynamicsCompressor()
 
@@ -85,8 +118,8 @@ export class AudioEngine {
     for (let channel = 0; channel < 2; channel++) {
       const channelData = impulse.getChannelData(channel)
       for (let i = 0; i < length; i++) {
-        const envelope = Math.pow(1 - i / length, wet)
-        channelData[i] = (Math.random() * 2 - 1) * envelope * 0.1
+        const envelope = Math.pow(1 - i / length, wet * 2)
+        channelData[i] = (Math.random() * 2 - 1) * envelope * 0.15
       }
     }
 
@@ -94,202 +127,218 @@ export class AudioEngine {
   }
 
   private connectGraph() {
-    if (!this.audioContext || !this.gainNode || !this.analyserNode) return
+    if (!this.audioContext || !this.sourceNode || !this.gainNode || !this.analyserNode) return
 
-    if (this.sourceNode) {
-      this.sourceNode.disconnect()
-    }
+    let current: AudioNode = this.sourceNode
 
-    let current: AudioNode = this.gainNode
+    current.connect(this.gainNode)
+    current = this.gainNode
 
     for (let i = 0; i < this.eqFilters.length; i++) {
       current.connect(this.eqFilters[i])
       current = this.eqFilters[i]
+    }
+
+    if (this.effectsEnabled.has('compressor') && this.compressorNode) {
+      current.connect(this.compressorNode)
+      current = this.compressorNode
+    }
+
+    if (this.effectsEnabled.has('reverb') && this.convolverNode) {
+      const dryGain = this.audioContext.createGain()
+      const wetGain = this.audioContext.createGain()
+      dryGain.gain.value = 0.7
+      wetGain.gain.value = 0.3
+      current.connect(dryGain)
+      current.connect(this.convolverNode)
+      this.convolverNode.connect(wetGain)
+      dryGain.connect(this.analyserNode)
+      wetGain.connect(this.analyserNode)
+      this.analyserNode.connect(this.audioContext.destination)
+      return
+    }
+
+    if (this.effectsEnabled.has('stereo') && this.stereoPannerNode) {
+      current.connect(this.stereoPannerNode)
+      current = this.stereoPannerNode
     }
 
     current.connect(this.analyserNode)
     this.analyserNode.connect(this.audioContext.destination)
   }
 
-  private reconnectWithEffects(effects: EffectConfig[]) {
-    if (!this.audioContext || !this.gainNode) return
+  private reconnectGraph() {
+    if (!this.audioContext || !this.sourceNode || !this.gainNode) return
 
-    const activeEffects = effects
-      .filter(e => e.enabled)
-      .sort((a, b) => a.order - b.order)
-
-    for (let i = this.eqFilters.length - 1; i >= 0; i--) {
-      try { this.eqFilters[i].disconnect() } catch {}
-    }
-
-    let current: AudioNode = this.gainNode
-    for (let i = 0; i < this.eqFilters.length; i++) {
-      current.connect(this.eqFilters[i])
-      current = this.eqFilters[i]
-    }
-
-    for (const effect of activeEffects) {
-      const node = this.effectNodes.get(effect.type)
-      if (node) {
-        current.connect(node)
-        current = node
+    try {
+      for (let i = 0; i < this.eqFilters.length; i++) {
+        this.eqFilters[i].disconnect()
       }
-    }
+      if (this.compressorNode) this.compressorNode.disconnect()
+      if (this.convolverNode) this.convolverNode.disconnect()
+      if (this.stereoPannerNode) this.stereoPannerNode.disconnect()
+      if (this.analyserNode) this.analyserNode.disconnect()
+      this.gainNode.disconnect()
 
-    if (this.analyserNode) {
-      current.connect(this.analyserNode)
-      this.analyserNode.connect(this.audioContext.destination)
+      let current: AudioNode = this.sourceNode
+      current.connect(this.gainNode)
+      current = this.gainNode
+
+      for (let i = 0; i < this.eqFilters.length; i++) {
+        current.connect(this.eqFilters[i])
+        current = this.eqFilters[i]
+      }
+
+      if (this.effectsEnabled.has('compressor') && this.compressorNode) {
+        current.connect(this.compressorNode)
+        current = this.compressorNode
+      }
+
+      if (this.effectsEnabled.has('stereo') && this.stereoPannerNode) {
+        current.connect(this.stereoPannerNode)
+        current = this.stereoPannerNode
+      }
+
+      if (this.effectsEnabled.has('reverb') && this.convolverNode && this.analyserNode) {
+        const dryGain = this.audioContext.createGain()
+        const wetGain = this.audioContext.createGain()
+        dryGain.gain.value = 0.7
+        wetGain.gain.value = 0.3
+
+        const splitter = current
+        splitter.connect(dryGain)
+        splitter.connect(this.convolverNode)
+        this.convolverNode.connect(wetGain)
+
+        dryGain.connect(this.analyserNode)
+        wetGain.connect(this.analyserNode)
+        this.analyserNode.connect(this.audioContext.destination)
+      } else {
+        current.connect(this.analyserNode!)
+        this.analyserNode!.connect(this.audioContext.destination)
+      }
+    } catch (err) {
+      console.warn('Reconnect graph failed:', err)
     }
   }
 
-  async loadSong(song: Song, file: File | null): Promise<void> {
-    if (!this.audioContext) {
-      this.initAudioContext()
+  async loadSong(song: Song, file?: File, blobUrl?: string): Promise<void> {
+    if (!this.audioElement) {
+      this.audioElement = new Audio()
     }
 
-    if (!this.audioContext) {
-      throw new Error('AudioContext not available')
-    }
-
-    if (this.audioContext.state === 'suspended') {
-      await this.audioContext.resume()
-    }
-
-    this.stop()
     this.currentSong = song
 
     if (file) {
-      if (this.fileUrl) {
-        URL.revokeObjectURL(this.fileUrl)
-      }
-      this.fileUrl = URL.createObjectURL(file)
-
-      try {
-        const arrayBuffer = await file.arrayBuffer()
-        this.audioBuffer = await this.audioContext.decodeAudioData(arrayBuffer.slice(0))
-      } catch (err) {
-        console.warn('decodeAudioData failed, falling back to HTMLAudioElement', err)
-        this.audioBuffer = null
-      }
-    }
-  }
-
-  play(offset?: number): void {
-    if (!this.audioContext || !this.currentSong) return
-
-    if (this.audioContext.state === 'suspended') {
-      this.audioContext.resume()
-    }
-
-    if (this.audioBuffer) {
-      this.playFromBuffer(offset)
+      const url = URL.createObjectURL(file)
+      this.audioElement.src = url
+    } else if (blobUrl) {
+      this.audioElement.src = blobUrl
     } else {
-      this.playFromFileUrl(offset)
+      throw new Error('No audio source provided')
+    }
+
+    try {
+      await this.audioElement.load()
+    } catch (err) {
+      console.warn('Audio load warning:', err)
     }
   }
 
-  private playFromBuffer(offset?: number): void {
-    if (!this.audioContext || !this.audioBuffer || !this.gainNode) return
+  async play(offset?: number): Promise<void> {
+    if (!this.audioElement) return
 
-    this.stop()
+    await this.ensureAudioContext()
 
-    this.sourceNode = this.audioContext.createBufferSource()
-    this.sourceNode.buffer = this.audioBuffer
-    this.sourceNode.connect(this.gainNode)
-
-    const startTime = offset || this.pauseTime || 0
-    this.sourceNode.start(0, startTime)
-    this.startTime = this.audioContext.currentTime - startTime
-    this.isPlaying = true
-
-    this.sourceNode.onended = () => {
-      if (this.isPlaying) {
-        this.isPlaying = false
-        this.onEnded?.()
-      }
+    if (this.audioContext?.state === 'suspended') {
+      await this.audioContext.resume()
     }
 
-    this.startTimeUpdate()
-  }
+    if (offset !== undefined && this.audioElement) {
+      try {
+        this.audioElement.currentTime = offset
+      } catch {}
+    }
 
-  private playFromFileUrl(offset?: number): void {
-    if (!this.fileUrl || !this.audioContext) return
+    try {
+      await this.audioElement.play()
+      this.isPlaying = true
+      this.startSmoothEq()
+    } catch (err) {
+      console.error('Play failed:', err)
+      throw err
+    }
   }
 
   pause(): void {
-    if (!this.isPlaying || !this.audioContext) return
-
-    if (this.sourceNode) {
-      this.pauseTime = this.audioContext.currentTime - this.startTime
-      this.sourceNode.stop()
-      this.sourceNode.disconnect()
-      this.sourceNode = null
-    }
-
+    if (!this.audioElement) return
+    this.audioElement.pause()
     this.isPlaying = false
-    this.stopTimeUpdate()
   }
 
   stop(): void {
-    if (this.sourceNode) {
-      try {
-        this.sourceNode.stop()
-      } catch {}
-      this.sourceNode.disconnect()
-      this.sourceNode = null
+    if (this.audioElement) {
+      this.audioElement.pause()
+      this.audioElement.currentTime = 0
     }
     this.isPlaying = false
-    this.pauseTime = 0
-    this.stopTimeUpdate()
   }
 
   seek(time: number): void {
-    if (!this.audioBuffer && !this.fileUrl) return
-
-    const wasPlaying = this.isPlaying
-    this.pauseTime = clamp(time, 0, this.getDuration())
-
-    if (wasPlaying) {
-      this.play(this.pauseTime)
+    if (!this.audioElement) return
+    try {
+      this.audioElement.currentTime = clamp(time, 0, this.getDuration())
+    } catch (err) {
+      console.warn('Seek failed:', err)
     }
   }
 
-  private startTimeUpdate(): void {
-    const update = () => {
-      if (this.isPlaying && this.audioContext) {
-        const currentTime = this.audioContext.currentTime - this.startTime
-        this.onTimeUpdate?.(currentTime)
+  private startSmoothEq(): void {
+    if (this.animationFrameId) return
+
+    const animate = () => {
+      let allDone = true
+      for (let i = 0; i < 10; i++) {
+        const diff = this.targetEqBands[i] - this.currentEqBands[i]
+        if (Math.abs(diff) > 0.01) {
+          this.currentEqBands[i] = lerp(this.currentEqBands[i], this.targetEqBands[i], this.eqSmoothing)
+          allDone = false
+        } else {
+          this.currentEqBands[i] = this.targetEqBands[i]
+        }
       }
-      this.animationFrameId = requestAnimationFrame(update)
-    }
-    this.animationFrameId = requestAnimationFrame(update)
-  }
 
-  private stopTimeUpdate(): void {
-    if (this.animationFrameId) {
-      cancelAnimationFrame(this.animationFrameId)
-      this.animationFrameId = null
+      for (let i = 0; i < this.eqFilters.length && i < this.currentEqBands.length; i++) {
+        if (this.eqFilters[i]) {
+          this.eqFilters[i].gain.value = this.currentEqBands[i]
+        }
+      }
+
+      if (!allDone || this.isPlaying) {
+        this.animationFrameId = requestAnimationFrame(animate)
+      } else {
+        this.animationFrameId = null
+      }
     }
+
+    this.animationFrameId = requestAnimationFrame(animate)
   }
 
   getCurrentTime(): number {
-    if (!this.isPlaying || !this.audioContext) {
-      return this.pauseTime || 0
-    }
-    return this.audioContext.currentTime - this.startTime
+    return this.audioElement?.currentTime || 0
   }
 
   getDuration(): number {
-    if (this.audioBuffer) {
-      return this.audioBuffer.duration
-    }
-    return this.currentSong?.duration || 0
+    return this.audioElement?.duration || this.currentSong?.duration || 0
   }
 
   setVolume(volume: number): void {
     this.volume = clamp(volume, 0, 1)
     if (this.gainNode && !this.muted) {
-      this.gainNode.gain.setTargetAtTime(this.volume, this.audioContext?.currentTime || 0, 0.01)
+      this.gainNode.gain.setTargetAtTime(this.volume, this.audioContext?.currentTime || 0, 0.02)
+    }
+    if (this.audioElement) {
+      this.audioElement.volume = this.volume
     }
   }
 
@@ -303,6 +352,9 @@ export class AudioEngine {
       const targetValue = muted ? 0 : this.volume
       this.gainNode.gain.setTargetAtTime(targetValue, this.audioContext?.currentTime || 0, 0.05)
     }
+    if (this.audioElement) {
+      this.audioElement.muted = muted
+    }
   }
 
   isMuted(): boolean {
@@ -313,42 +365,20 @@ export class AudioEngine {
     this.targetEqBands = [...bands]
     if (!smooth) {
       this.currentEqBands = [...bands]
-      this.applyEqBands()
-    } else {
-      this.smoothEqTransition()
-    }
-  }
-
-  private smoothEqTransition(): void {
-    const animate = () => {
-      let allDone = true
-      for (let i = 0; i < 10; i++) {
-        const diff = this.targetEqBands[i] - this.currentEqBands[i]
-        if (Math.abs(diff) > 0.01) {
-          this.currentEqBands[i] = lerp(this.currentEqBands[i], this.targetEqBands[i], this.eqSmoothing)
-          allDone = false
-        } else {
-          this.currentEqBands[i] = this.targetEqBands[i]
+      for (let i = 0; i < this.eqFilters.length && i < this.currentEqBands.length; i++) {
+        if (this.eqFilters[i]) {
+          this.eqFilters[i].gain.value = this.currentEqBands[i]
         }
       }
-      this.applyEqBands()
-      if (!allDone) {
-        requestAnimationFrame(animate)
-      }
-    }
-    animate()
-  }
-
-  private applyEqBands(): void {
-    for (let i = 0; i < this.eqFilters.length && i < this.currentEqBands.length; i++) {
-      this.eqFilters[i].gain.value = this.currentEqBands[i]
+    } else {
+      this.startSmoothEq()
     }
   }
 
   setEqBand(index: number, gain: number): void {
-    if (index >= 0 && index < this.eqFilters.length) {
+    if (index >= 0 && index < 10) {
       this.targetEqBands[index] = clamp(gain, -12, 12)
-      this.smoothEqTransition()
+      this.startSmoothEq()
     }
   }
 
@@ -361,7 +391,16 @@ export class AudioEngine {
   }
 
   setEffects(effects: EffectConfig[]): void {
-    this.reconnectWithEffects(effects)
+    this.effectsEnabled.clear()
+    for (const effect of effects) {
+      if (effect.enabled) {
+        this.effectsEnabled.add(effect.type)
+      }
+    }
+
+    if (this.isInitialized) {
+      this.reconnectGraph()
+    }
   }
 
   setReverbParams(decay: number, wet: number): void {
@@ -391,6 +430,10 @@ export class AudioEngine {
     this.onEnded = callback
   }
 
+  setOnLoadedMetadata(callback: (duration: number) => void): void {
+    this.onLoadedMetadata = callback
+  }
+
   getIsPlaying(): boolean {
     return this.isPlaying
   }
@@ -406,14 +449,15 @@ export class AudioEngine {
   }
 
   destroy(): void {
-    this.stop()
-    if (this.fileUrl) {
-      URL.revokeObjectURL(this.fileUrl)
-      this.fileUrl = null
+    if (this.audioElement) {
+      this.audioElement.pause()
+      this.audioElement.src = ''
+    }
+    if (this.animationFrameId) {
+      cancelAnimationFrame(this.animationFrameId)
     }
     if (this.audioContext) {
       this.audioContext.close()
-      this.audioContext = null
     }
   }
 
@@ -429,6 +473,10 @@ export class AudioEngine {
     const dataArray = new Uint8Array(this.analyserNode.fftSize)
     this.analyserNode.getByteTimeDomainData(dataArray)
     return dataArray
+  }
+
+  getAudioElement(): HTMLAudioElement | null {
+    return this.audioElement
   }
 }
 

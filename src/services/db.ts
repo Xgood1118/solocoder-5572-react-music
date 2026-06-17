@@ -206,18 +206,37 @@ export async function searchSongs(query: string): Promise<Song[]> {
 export async function getStatistics(startDate?: number, endDate?: number): Promise<StatisticsData> {
   const db = await initDB()
   const songs = await db.getAll('songs')
+  const allHistory = await db.getAllFromIndex('playHistory', 'by-timestamp')
+
+  const filteredHistory = allHistory.filter(h => {
+    if (startDate !== undefined && h.timestamp < startDate) return false
+    if (endDate !== undefined && h.timestamp > endDate) return false
+    return true
+  })
 
   const totalSongs = songs.length
   const totalDuration = songs.reduce((sum, s) => sum + s.duration, 0)
-  const totalPlayCount = songs.reduce((sum, s) => sum + s.playCount, 0)
+
+  const totalPlayCount = filteredHistory.length
+  const totalPlayDuration = filteredHistory.reduce((sum, h) => sum + (h.duration || 0), 0)
+
+  const playCountBySong: Record<string, number> = {}
+  for (const h of filteredHistory) {
+    playCountBySong[h.songId] = (playCountBySong[h.songId] || 0) + 1
+  }
+
+  const songMap = new Map(songs.map(s => [s.id, s]))
 
   const artistStats: Record<string, { playCount: number; duration: number }> = {}
-  for (const song of songs) {
+  for (const h of filteredHistory) {
+    const song = songMap.get(h.songId)
+    if (!song) continue
+
     if (!artistStats[song.artist]) {
       artistStats[song.artist] = { playCount: 0, duration: 0 }
     }
-    artistStats[song.artist].playCount += song.playCount
-    artistStats[song.artist].duration += song.duration * song.playCount
+    artistStats[song.artist].playCount++
+    artistStats[song.artist].duration += h.duration || song.duration
   }
 
   const topArtists = Object.entries(artistStats)
@@ -225,17 +244,27 @@ export async function getStatistics(startDate?: number, endDate?: number): Promi
     .sort((a, b) => b.playCount - a.playCount)
     .slice(0, 20)
 
-  const topSongs = [...songs]
-    .sort((a, b) => b.playCount - a.playCount)
+  const topSongs = songs
+    .map(song => ({
+      ...song,
+      periodPlayCount: playCountBySong[song.id] || 0
+    }))
+    .filter(s => s.periodPlayCount > 0)
+    .sort((a, b) => b.periodPlayCount - a.periodPlayCount)
     .slice(0, 20)
+    .map(({ periodPlayCount, ...song }) => song as Song)
+
+  const totalPlayedSongs = Object.keys(playCountBySong).length
 
   return {
     totalSongs,
     totalDuration,
     totalPlayCount,
+    totalPlayDuration,
+    totalPlayedSongs,
     topArtists,
     topSongs,
-    playHistory: []
+    playHistory: filteredHistory
   }
 }
 

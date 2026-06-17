@@ -96,9 +96,11 @@ export interface StatisticsData {
   totalSongs: number
   totalDuration: number
   totalPlayCount: number
+  totalPlayDuration: number
+  totalPlayedSongs: number
   topArtists: { artist: string; playCount: number; duration: number }[]
   topSongs: Song[]
-  playHistory: { date: string; count: number; duration: number }[]
+  playHistory: { id: string; songId: string; timestamp: number; duration: number }[]
 }
 
 export interface DuplicateCandidate {

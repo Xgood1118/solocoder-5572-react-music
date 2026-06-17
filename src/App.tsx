@@ -10,16 +10,25 @@ import { StatisticsView } from './components/StatisticsView'
 import { SearchBar } from './components/SearchBar'
 import { MetadataViewer } from './components/MetadataViewer'
 import { usePlayerStore } from './store/playerStore'
-import { AudioEngine, getAudioEngine } from './services/audioEngine'
-import { initDB, getAllSongs, addSongs, deleteSong, getRecentlyAdded, getMostPlayed, getStatistics, recordPlay } from './services/db'
-import { requestDirectoryPermission, scanDirectory, setupWebkitDirectoryInput, handleFiles, supportsFileSystemAccess, setupDragDrop } from './services/fileSystem'
+import { getAudioEngine } from './services/audioEngine'
+import {
+  initDB, getAllSongs, addSongs, deleteSong,
+  getRecentlyAdded, getMostPlayed, getStatistics, recordPlay,
+  getSetting, setSetting
+} from './services/db'
+import {
+  requestDirectoryPermission, scanDirectoryWithFiles, setupWebkitDirectoryInput,
+  handleFiles, supportsFileSystemAccess, setupDragDrop,
+  getSavedDirectoryHandle, getFileFromHandle
+} from './services/fileSystem'
 import { findDuplicates, calculateSimilarity } from './services/metadata'
-import { getSongLyrics, fetchLyricsOnline } from './services/lyrics'
-import { setupMediaSession, updateMediaSession, updateMediaSessionPlaybackState, registerMediaSessionHandlers } from './services/mediaSession'
+import { getSongLyrics } from './services/lyrics'
+import { setupMediaSession, updateMediaSession, registerMediaSessionHandlers } from './services/mediaSession'
 import { applyTheme, loadSavedTheme, saveTheme } from './services/theme'
 import { setupKeyboardShortcuts } from './services/shortcuts'
+import { fileCache } from './services/fileCache'
 import type { Song, PlayMode, LyricsData, StatisticsData, DuplicateCandidate } from './types'
-import type { VisualizerType } from './types'
+import type { VisualizerType, ThemeConfig, EffectConfig } from './types'
 
 function App() {
   const {
@@ -33,8 +42,7 @@ function App() {
     muted, setMuted,
     playMode, setPlayMode,
     queue,
-    eqBands, setEqBands,
-    eqPreset, setEqPreset,
+    eqBands,
     autoEq, setAutoEq,
     effects, setEffects,
     visualizer, setVisualizer,
@@ -45,19 +53,15 @@ function App() {
     showEqualizer, setShowEqualizer,
     showVisualizer, setShowVisualizer,
     showLyrics, setShowLyrics,
-    playSong: storePlaySong,
-    playNext: storePlayNext,
-    playPrev: storePlayPrev,
-    togglePlay: storeTogglePlay,
-    addToQueue: storeAddToQueue,
     setEqBand,
     resetEq,
     applyEqPreset,
     toggleEffect,
-    setEffectParam
+    setEffectParam,
+    addToQueue: storeAddToQueue
   } = usePlayerStore()
 
-  const audioEngineRef = useRef<AudioEngine | null>(null)
+  const audioEngineRef = useRef<ReturnType<typeof getAudioEngine> | null>(null)
   const fileInputRef = useRef<HTMLInputElement | null>(null)
   const folderInputRef = useRef<HTMLInputElement | null>(null)
   const [lyrics, setLyrics] = useState<LyricsData | null>(null)
@@ -69,9 +73,13 @@ function App() {
   const [statsPeriod, setStatsPeriod] = useState<'week' | 'month' | 'year' | 'all'>('all')
   const [duplicates, setDuplicates] = useState<DuplicateCandidate[]>([])
   const mainRef = useRef<HTMLDivElement>(null)
+  const isInitialized = useRef(false)
 
   useEffect(() => {
     const init = async () => {
+      if (isInitialized.current) return
+      isInitialized.current = true
+
       await initDB()
 
       const savedTheme = await loadSavedTheme()
@@ -83,10 +91,7 @@ function App() {
       setFilteredSongs(loadedSongs)
 
       if (loadedSongs.length > 0) {
-        const recent = await getRecentlyAdded(50)
-        setRecentSongs(recent)
-        const top = await getMostPlayed(50)
-        setTopSongs(top)
+        await loadSmartLists()
         const statistics = await getStatistics()
         setStats(statistics)
       }
@@ -96,7 +101,7 @@ function App() {
       const engine = getAudioEngine()
       audioEngineRef.current = engine
 
-      engine.setOnTimeUpdate((time) => {
+      engine.setOnTimeUpdate((time: number) => {
         setCurrentTime(time)
       })
 
@@ -104,15 +109,45 @@ function App() {
         handleSongEnded()
       })
 
+      engine.setOnLoadedMetadata((dur: number) => {
+        setDuration(dur)
+      })
+
+      engine.setVolume(volume)
+      engine.setMuted(muted)
+      engine.setEqBands(eqBands, false)
+      engine.setEffects(effects)
+
       registerMediaSessionHandlers({
         onPlay: () => handlePlayPause(),
         onPause: () => handlePlayPause(),
         onNext: () => handleNext(),
         onPrev: () => handlePrev(),
-        onSeekForward: (s) => handleSeek(currentTime + s),
-        onSeekBackward: (s) => handleSeek(Math.max(0, currentTime - s)),
-        onSeekTo: (t) => handleSeek(t)
+        onSeekForward: (s: number) => handleSeek(currentTime + s),
+        onSeekBackward: (s: number) => handleSeek(Math.max(0, currentTime - s)),
+        onSeekTo: (t: number) => handleSeek(t)
       })
+
+      try {
+        const savedDirHandle = await getSavedDirectoryHandle()
+        if (savedDirHandle && loadedSongs.length > 0) {
+          console.log('Restored directory handle, re-caching files...')
+          const scanResult = await scanDirectoryWithFiles(savedDirHandle as any, {})
+          
+          for (const song of loadedSongs) {
+            const file = scanResult.fileMap.get(song.filePath)
+            const handle = scanResult.handleMap.get(song.filePath)
+            if (file) {
+              fileCache.setFile(song.id, file)
+            }
+            if (handle) {
+              fileCache.setHandle(song.id, handle)
+            }
+          }
+        }
+      } catch (err) {
+        console.warn('Failed to restore directory cache:', err)
+      }
     }
 
     init()
@@ -121,8 +156,8 @@ function App() {
       onPlayPause: () => handlePlayPause(),
       onNextTrack: () => handleNext(),
       onPrevTrack: () => handlePrev(),
-      onSeekForward: (s) => handleSeek(currentTime + s),
-      onSeekBackward: (s) => handleSeek(Math.max(0, currentTime - s)),
+      onSeekForward: (s: number) => handleSeek(currentTime + s),
+      onSeekBackward: (s: number) => handleSeek(Math.max(0, currentTime - s)),
       onVolumeUp: () => setVolume(Math.min(1, volume + 0.05)),
       onVolumeDown: () => setVolume(Math.max(0, volume - 0.05)),
       onMute: () => setMuted(!muted),
@@ -140,7 +175,6 @@ function App() {
 
     return () => {
       cleanupShortcuts()
-      audioEngineRef.current?.destroy()
     }
   }, [])
 
@@ -189,38 +223,89 @@ function App() {
     }
   }, [searchQuery, songs])
 
-  useEffect(() => {
-    if (mainRef.current) {
-      setupDragDrop(mainRef.current, async (files) => {
-        await handleDroppedFiles(files)
-      })
+  const refreshStats = async (period: 'week' | 'month' | 'year' | 'all') => {
+    const now = Date.now()
+    let startDate: number | undefined
+    const endDate = now
+
+    switch (period) {
+      case 'week':
+        startDate = now - 7 * 24 * 60 * 60 * 1000
+        break
+      case 'month':
+        startDate = now - 30 * 24 * 60 * 60 * 1000
+        break
+      case 'year':
+        startDate = now - 365 * 24 * 60 * 60 * 1000
+        break
+      case 'all':
+      default:
+        startDate = undefined
+        break
     }
-  }, [songs])
+
+    const statistics = await getStatistics(startDate, endDate)
+    setStats(statistics)
+  }
+
+  useEffect(() => {
+    if (songs.length > 0) {
+      refreshStats(statsPeriod)
+    }
+  }, [statsPeriod, songs.length])
+
+  const loadSmartLists = async () => {
+    const recent = await getRecentlyAdded(50)
+    setRecentSongs(recent)
+    const top = await getMostPlayed(50)
+    setTopSongs(top)
+  }
 
   const handleDroppedFiles = async (files: File[]) => {
     setIsLoading(true)
     try {
-      const newSongs = await handleFiles(files, {
-        onProgress: (current, total, fileName) => {
+      const fileArray = files
+      const newSongs = await handleFiles(fileArray, {
+        onProgress: (current: number, total: number, fileName: string) => {
           console.log(`Processing ${current}/${total}: ${fileName}`)
         }
       })
 
       const existingSongs = songs
-      const uniqueSongs = newSongs.filter(ns =>
-        !existingSongs.some(es => calculateSimilarity(es, ns) < 0.85)
-      )
+      const uniqueSongs: any[] = []
+      const fileMap = new Map<string, File>()
+
+      for (let i = 0; i < newSongs.length; i++) {
+        const ns = newSongs[i] as any
+        const isDuplicate = existingSongs.some(es => calculateSimilarity(es, ns) >= 0.85)
+        if (!isDuplicate) {
+          uniqueSongs.push(ns)
+          if (fileArray[i]) {
+            fileMap.set(ns.fileName + ns.fileSize, fileArray[i])
+          }
+        }
+      }
 
       if (uniqueSongs.length > 0) {
         const addedSongs = await addSongs(uniqueSongs)
+
+        for (let i = 0; i < addedSongs.length; i++) {
+          const song = addedSongs[i]
+          const originalFile = fileMap.get(song.fileName + song.fileSize)
+          if (originalFile) {
+            fileCache.setFile(song.id, originalFile)
+          }
+        }
+
         const allSongs = [...existingSongs, ...addedSongs]
         setSongs(allSongs)
         setFilteredSongs(allSongs)
+        await loadSmartLists()
       }
 
-      const dups = findDuplicates([...songs, ...newSongs], 0.85)
+      const dups = findDuplicates([...songs, ...newSongs] as any, 0.85)
       if (dups.length > 0) {
-        setDuplicates(dups)
+        setDuplicates(dups as any)
       }
     } catch (err) {
       console.error('Failed to add files:', err)
@@ -230,63 +315,86 @@ function App() {
   }
 
   const handleAddFolder = async () => {
-    if (supportsFileSystemAccess()) {
-      const dirHandle = await requestDirectoryPermission()
-      if (dirHandle) {
-        setIsLoading(true)
-        try {
-          const newSongs = await scanDirectory(dirHandle as any, {
-            onProgress: (current, total, fileName) => {
+    setIsLoading(true)
+    try {
+      if (supportsFileSystemAccess()) {
+        const dirHandle = await requestDirectoryPermission()
+        if (dirHandle) {
+          const result = await scanDirectoryWithFiles(dirHandle as any, {
+            onProgress: (current: number, total: number, fileName: string) => {
               console.log(`Scanning ${current}/${total}: ${fileName}`)
             }
           })
 
           const existingSongs = songs
-          const uniqueSongs = newSongs.filter(ns =>
-            !existingSongs.some(es => calculateSimilarity(es, ns) < 0.85)
-          )
+          const uniqueSongs: any[] = []
+          const uniqueFiles: { song: any; file: File; handle: any }[] = []
+
+          for (const ns of result.songs) {
+            const isDuplicate = existingSongs.some(es => calculateSimilarity(es, ns) >= 0.85)
+            if (!isDuplicate) {
+              uniqueSongs.push(ns)
+              const file = result.fileMap.get(ns.filePath)
+              const handle = result.handleMap.get(ns.filePath)
+              if (file && handle) {
+                uniqueFiles.push({ song: ns, file, handle })
+              }
+            }
+          }
 
           if (uniqueSongs.length > 0) {
-            const addedSongs = await addSongs(uniqueSongs)
+            const addedSongs = await addSongs(uniqueSongs as any)
+
+            for (let i = 0; i < addedSongs.length; i++) {
+              const matchingFile = uniqueFiles.find(
+                f => f.song.fileName === addedSongs[i].fileName && f.song.fileSize === addedSongs[i].fileSize
+              )
+              if (matchingFile) {
+                fileCache.setFile(addedSongs[i].id, matchingFile.file)
+                fileCache.setHandle(addedSongs[i].id, matchingFile.handle)
+              }
+            }
+
             const allSongs = [...existingSongs, ...addedSongs]
             setSongs(allSongs)
             setFilteredSongs(allSongs)
+            await loadSmartLists()
           }
-        } catch (err) {
-          console.error('Failed to scan directory:', err)
-        } finally {
-          setIsLoading(false)
         }
-      }
-    } else {
-      if (!folderInputRef.current) {
-        folderInputRef.current = document.createElement('input')
-      }
-      const input = folderInputRef.current
-      setIsLoading(true)
-      try {
+      } else {
+        if (!folderInputRef.current) {
+          folderInputRef.current = document.createElement('input')
+        }
+        const input = folderInputRef.current
+
         const newSongs = await setupWebkitDirectoryInput(input, {
-          onProgress: (current, total, fileName) => {
+          onProgress: (current: number, total: number, fileName: string) => {
             console.log(`Scanning ${current}/${total}: ${fileName}`)
           }
         })
 
         const existingSongs = songs
-        const uniqueSongs = newSongs.filter(ns =>
-          !existingSongs.some(es => calculateSimilarity(es, ns) < 0.85)
-        )
+        const uniqueSongs: any[] = []
+
+        for (const ns of newSongs) {
+          const isDuplicate = existingSongs.some(es => calculateSimilarity(es, ns) >= 0.85)
+          if (!isDuplicate) {
+            uniqueSongs.push(ns)
+          }
+        }
 
         if (uniqueSongs.length > 0) {
-          const addedSongs = await addSongs(uniqueSongs)
+          const addedSongs = await addSongs(uniqueSongs as any)
           const allSongs = [...existingSongs, ...addedSongs]
           setSongs(allSongs)
           setFilteredSongs(allSongs)
+          await loadSmartLists()
         }
-      } catch (err) {
-        console.error('Failed to scan directory:', err)
-      } finally {
-        setIsLoading(false)
       }
+    } catch (err) {
+      console.error('Failed to add folder:', err)
+    } finally {
+      setIsLoading(false)
     }
   }
 
@@ -300,25 +408,7 @@ function App() {
     input.accept = 'audio/*'
     input.onchange = async () => {
       if (input.files) {
-        setIsLoading(true)
-        try {
-          const newSongs = await handleFiles(input.files)
-          const existingSongs = songs
-          const uniqueSongs = newSongs.filter(ns =>
-            !existingSongs.some(es => calculateSimilarity(es, ns) < 0.85)
-          )
-
-          if (uniqueSongs.length > 0) {
-            const addedSongs = await addSongs(uniqueSongs)
-            const allSongs = [...existingSongs, ...addedSongs]
-            setSongs(allSongs)
-            setFilteredSongs(allSongs)
-          }
-        } catch (err) {
-          console.error('Failed to add files:', err)
-        } finally {
-          setIsLoading(false)
-        }
+        await handleDroppedFiles(Array.from(input.files))
       }
     }
     input.click()
@@ -329,47 +419,80 @@ function App() {
     const song = songList[index]
     if (!song || !audioEngineRef.current) return
 
-    storePlaySong(index)
-    setCurrentSong(song)
-    setDuration(song.duration)
-
     try {
-      const file = await getFileForSong(song)
-      if (file) {
-        await audioEngineRef.current.loadSong(song, file)
-        audioEngineRef.current.play()
-        setIsPlaying(true)
-        setCurrentTime(0)
+      setIsLoading(true)
 
+      let file = fileCache.getFile(song.id)
+      if (!file) {
+        const originalFile = await findOriginalFileForSong(song)
+        if (originalFile) {
+          file = originalFile
+          fileCache.setFile(song.id, originalFile)
+        }
+      }
+
+      if (!file) {
+        console.warn('No file available for song:', song.title)
+        alert('无法播放：文件引用已丢失。请重新添加该歌曲。')
+        setIsLoading(false)
+        return
+      }
+
+      setCurrentIndex(index)
+      setCurrentSong(song)
+      setDuration(song.duration)
+
+      await audioEngineRef.current.loadSong(song as any, file)
+      await audioEngineRef.current.play()
+
+      setIsPlaying(true)
+      setCurrentTime(0)
+
+      try {
         await recordPlay(song.id, song.duration)
+      } catch {}
 
+      try {
         const lyricsData = await getSongLyrics(song.id, song.title, song.artist)
         setLyrics(lyricsData)
+      } catch (err) {
+        console.warn('Lyrics loading failed:', err)
+      }
 
-        if (autoEq) {
-          applyAutoEQ(song)
-        }
+      if (autoEq) {
+        applyAutoEQ(song as any)
       }
     } catch (err) {
       console.error('Failed to play song:', err)
+    } finally {
+      setIsLoading(false)
     }
   }
 
-  const getFileForSong = async (song: Song): Promise<File | null> => {
+  const findOriginalFileForSong = async (song: Song): Promise<File | null> => {
+    try {
+      const handle = fileCache.getHandle(song.id)
+      if (handle && 'getFile' in handle) {
+        return await (handle as any).getFile()
+      }
+    } catch {}
     return null
   }
 
-  const handlePlayPause = useCallback(() => {
+  const handlePlayPause = useCallback(async () => {
     if (!audioEngineRef.current || !currentSong) return
 
     if (isPlaying) {
       audioEngineRef.current.pause()
       setIsPlaying(false)
     } else {
-      audioEngineRef.current.play()
-      setIsPlaying(true)
+      try {
+        await audioEngineRef.current.play()
+        setIsPlaying(true)
+      } catch (err) {
+        console.error('Play failed:', err)
+      }
     }
-    updateMediaSessionPlaybackState(!isPlaying)
   }, [isPlaying, currentSong])
 
   const handleNext = () => {
@@ -394,7 +517,9 @@ function App() {
       nextIndex = (currentIndex + 1) % songList.length
     }
 
-    handlePlaySong(nextIndex)
+    if (nextIndex >= 0 && nextIndex < songList.length) {
+      handlePlaySong(nextIndex)
+    }
   }
 
   const handlePrev = () => {
@@ -434,7 +559,7 @@ function App() {
   }
 
   const applyAutoEQ = (song: Song) => {
-    const genre = song.genre?.[0]?.toLowerCase() || ''
+    const genre = (song.genre?.[0] || '').toLowerCase()
 
     if (genre.includes('rock') || genre.includes('metal')) {
       applyEqPreset('rock')
@@ -448,7 +573,7 @@ function App() {
       applyEqPreset('electronic')
     } else if (genre.includes('acoustic') || genre.includes('folk')) {
       applyEqPreset('acoustic')
-    } else if (genre.includes('vocal') || genre.includes('vocaloid')) {
+    } else if (genre.includes('vocal')) {
       applyEqPreset('vocal')
     }
   }
@@ -457,7 +582,7 @@ function App() {
     setCurrentView(view)
   }
 
-  const handleThemeChange = async (newTheme: any) => {
+  const handleThemeChange = async (newTheme: ThemeConfig) => {
     applyTheme(newTheme)
     setTheme(newTheme)
     await saveTheme(newTheme)
@@ -465,6 +590,7 @@ function App() {
 
   const handleRemoveSong = async (song: Song) => {
     await deleteSong(song.id)
+    fileCache.removeSong(song.id)
     const newSongs = songs.filter(s => s.id !== song.id)
     setSongs(newSongs)
     setFilteredSongs(newSongs)
@@ -558,7 +684,7 @@ function App() {
             <Visualizer
               audioContext={audioCtx}
               analyser={analyser}
-              type={visualizer.type}
+              type={visualizer.type as VisualizerType}
               beatSync={visualizer.beatSync}
               mouseInteraction={visualizer.mouseInteraction}
               sensitivity={visualizer.sensitivity}
@@ -602,7 +728,7 @@ function App() {
           <div className="equalizer-section">
             <EqualizerPanel
               eqBands={eqBands}
-              eqPreset={eqPreset}
+              eqPreset={'flat'}
               autoEq={autoEq}
               effects={effects}
               onEqBandChange={setEqBand}
